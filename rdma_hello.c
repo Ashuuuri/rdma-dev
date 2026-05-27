@@ -282,7 +282,7 @@ int main(int argc, char *argv[])
             .num_sge = 1,
         };
         struct ibv_recv_wr *bad_wr;
-        r(conn->qp, &wr, &bad_wr);
+        ibv_post_recv(conn->qp, &wr, &bad_wr);
 
         // poll CQ
         struct ibv_wc wc;
