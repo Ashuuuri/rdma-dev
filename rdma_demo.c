@@ -2,14 +2,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <infiniband/verbs.h>
 
-#define MSG       "Hello RDMA!"
-#define MSG_SIZE  64
-#define PORT      12345
-#define IB_PORT   1
-#define GID_INDEX 1
+#define MSG            "Hello RDMA!"
+#define MSG_SIZE       64
+#define BENCH_MAX_SIZE (1 << 20)
+#define PORT           12345
+#define IB_PORT        1
+#define GID_INDEX      1
+#define MAX_WR         4096
+
+#define BENCH_LAT 0
+#define BENCH_BW  1
+
+static const int SWEEP_SIZES[] = {
+    64, 256, 1024, 4096, 16384, 65536, 262144, 1048576
+};
+#define N_SWEEP_SIZES ((int)(sizeof(SWEEP_SIZES) / sizeof(SWEEP_SIZES[0])))
 
 struct connection {
     struct ibv_context      *ctx;
@@ -27,6 +38,22 @@ struct qp_info {
     uint32_t      rkey;
     uint64_t      addr;
 };
+
+struct bench_opts {
+    int   mode;
+    int   iters;
+    int   warmup;
+    int   size;
+    int   sweep;
+    int   depth;
+    char *output;
+};
+
+struct stats {
+    double avg, min, p50, p99, max;
+};
+
+// ── helpers ──────────────────────────────────────────────────────────────────
 
 static int send_all(int fd, const void *buf, size_t len)
 {
@@ -50,7 +77,36 @@ static int recv_all(int fd, void *buf, size_t len)
     return 0;
 }
 
-static struct connection *init_connection(void)
+static long now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000000L + ts.tv_nsec;
+}
+
+static int cmp_long(const void *a, const void *b)
+{
+    long x = *(const long *)a, y = *(const long *)b;
+    return (x > y) - (x < y);
+}
+
+static struct stats compute_stats(long *s, int n)
+{
+    qsort(s, n, sizeof(long), cmp_long);
+    double sum = 0;
+    for (int i = 0; i < n; i++) sum += s[i];
+    return (struct stats){
+        .avg = sum / n / 1000.0,
+        .min = s[0] / 1000.0,
+        .p50 = s[n / 2] / 1000.0,
+        .p99 = s[(int)(n * 0.99)] / 1000.0,
+        .max = s[n - 1] / 1000.0,
+    };
+}
+
+// ── RDMA setup ───────────────────────────────────────────────────────────────
+
+static struct connection *init_connection(size_t buf_size)
 {
     struct ibv_device **dev_list;
     struct ibv_qp_init_attr qp_attr;
@@ -86,13 +142,13 @@ static struct connection *init_connection(void)
         goto err_ctx;
     }
 
-    conn->buf = calloc(1, MSG_SIZE);
+    conn->buf = calloc(1, buf_size);
     if (!conn->buf) {
         fprintf(stderr, "failed to allocate buffer\n");
         goto err_pd;
     }
 
-    conn->mr = ibv_reg_mr(conn->pd, conn->buf, MSG_SIZE,
+    conn->mr = ibv_reg_mr(conn->pd, conn->buf, buf_size,
                           IBV_ACCESS_LOCAL_WRITE  |
                           IBV_ACCESS_REMOTE_WRITE |
                           IBV_ACCESS_REMOTE_READ);
@@ -107,7 +163,7 @@ static struct connection *init_connection(void)
         goto err_mr;
     }
 
-    conn->cq = ibv_create_cq(conn->ctx, 16, NULL, conn->channel, 0);
+    conn->cq = ibv_create_cq(conn->ctx, MAX_WR, NULL, conn->channel, 0);
     if (!conn->cq) {
         fprintf(stderr, "failed to create cq\n");
         goto err_channel;
@@ -116,8 +172,8 @@ static struct connection *init_connection(void)
     memset(&qp_attr, 0, sizeof(qp_attr));
     qp_attr.send_cq          = conn->cq;
     qp_attr.recv_cq          = conn->cq;
-    qp_attr.cap.max_send_wr  = 16;
-    qp_attr.cap.max_recv_wr  = 16;
+    qp_attr.cap.max_send_wr  = MAX_WR;
+    qp_attr.cap.max_recv_wr  = MAX_WR;
     qp_attr.cap.max_send_sge = 1;
     qp_attr.cap.max_recv_sge = 1;
     qp_attr.qp_type          = IBV_QPT_RC;
@@ -197,7 +253,8 @@ static int modify_qp_to_rts(struct ibv_qp *qp, uint32_t remote_qpn,
     return 0;
 }
 
-static void exchange_info_server(struct qp_info *local, struct qp_info *remote)
+// returns socket fd (kept open for bench sync)
+static int exchange_info_server(struct qp_info *local, struct qp_info *remote)
 {
     int sockfd, connfd;
     struct sockaddr_in addr;
@@ -214,15 +271,15 @@ static void exchange_info_server(struct qp_info *local, struct qp_info *remote)
     bind(sockfd, (struct sockaddr *)&addr, sizeof(addr));
     listen(sockfd, 1);
     connfd = accept(sockfd, NULL, NULL);
+    close(sockfd);
 
     send_all(connfd, local, sizeof(*local));
     recv_all(connfd, remote, sizeof(*remote));
 
-    close(connfd);
-    close(sockfd);
+    return connfd;
 }
 
-static void exchange_info_client(struct qp_info *local, struct qp_info *remote,
+static int exchange_info_client(struct qp_info *local, struct qp_info *remote,
                                   const char *server_ip)
 {
     int sockfd;
@@ -240,7 +297,7 @@ static void exchange_info_client(struct qp_info *local, struct qp_info *remote,
     recv_all(sockfd, remote, sizeof(*remote));
     send_all(sockfd, local, sizeof(*local));
 
-    close(sockfd);
+    return sockfd;
 }
 
 static int poll_cq(struct ibv_cq *cq)
@@ -270,6 +327,8 @@ static int wait_cq_event(struct connection *conn)
     ibv_ack_cq_events(ev_cq, 1);
     return poll_cq(conn->cq);
 }
+
+// ── functional ops ───────────────────────────────────────────────────────────
 
 static int op_send_recv(struct connection *conn, struct qp_info *remote, int is_server)
 {
@@ -388,22 +447,377 @@ static int op_read(struct connection *conn, struct qp_info *remote, int is_serve
     return 0;
 }
 
+// ── bench ─────────────────────────────────────────────────────────────────────
+
+// two-way handshake: neither side proceeds until both have called bench_sync
+static void bench_sync(int fd)
+{
+    char b = 0;
+    send_all(fd, &b, 1);
+    recv_all(fd, &b, 1);
+}
+
+static int bench_lat(struct connection *conn, struct qp_info *remote,
+                     int is_server, const char *op,
+                     struct bench_opts *opts, int size, int syncfd, FILE *csv)
+{
+    int total = opts->warmup + opts->iters;
+    long *samples = NULL;
+
+    struct ibv_sge sge = {
+        .addr   = (uint64_t)conn->buf,
+        .length = (uint32_t)size,
+        .lkey   = conn->mr->lkey,
+    };
+
+    if (strcmp(op, "send-recv") == 0) {
+        if (is_server) {
+            // post first recv WR, signal ready, then run echo loop
+            struct ibv_recv_wr rwr = { .wr_id = 0, .sg_list = &sge, .num_sge = 1 };
+            struct ibv_recv_wr *bad_rwr;
+            ibv_post_recv(conn->qp, &rwr, &bad_rwr);
+            bench_sync(syncfd);
+
+            for (int i = 0; i < total; i++) {
+                struct ibv_wc wc;
+                while (ibv_poll_cq(conn->cq, 1, &wc) == 0);
+                // post next recv before echoing to prevent RNR on subsequent iteration
+                if (i < total - 1)
+                    ibv_post_recv(conn->qp, &rwr, &bad_rwr);
+                struct ibv_send_wr swr = {
+                    .wr_id = 0, .sg_list = &sge, .num_sge = 1,
+                    .opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED,
+                };
+                struct ibv_send_wr *bad_swr;
+                ibv_post_send(conn->qp, &swr, &bad_swr);
+                while (ibv_poll_cq(conn->cq, 1, &wc) == 0);
+            }
+            bench_sync(syncfd);
+        } else {
+            samples = malloc(opts->iters * sizeof(long));
+            bench_sync(syncfd);
+
+            for (int i = 0; i < total; i++) {
+                long t0 = now_ns();
+                struct ibv_send_wr swr = {
+                    .wr_id = 0, .sg_list = &sge, .num_sge = 1,
+                    .opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED,
+                };
+                struct ibv_send_wr *bad_swr;
+                ibv_post_send(conn->qp, &swr, &bad_swr);
+                struct ibv_wc wc;
+                while (ibv_poll_cq(conn->cq, 1, &wc) == 0);
+                struct ibv_recv_wr rwr = { .wr_id = 0, .sg_list = &sge, .num_sge = 1 };
+                struct ibv_recv_wr *bad_rwr;
+                ibv_post_recv(conn->qp, &rwr, &bad_rwr);
+                while (ibv_poll_cq(conn->cq, 1, &wc) == 0);
+                long t1 = now_ns();
+                if (i >= opts->warmup)
+                    samples[i - opts->warmup] = (t1 - t0) / 2;
+            }
+            bench_sync(syncfd);
+
+            struct stats st = compute_stats(samples, opts->iters);
+            printf("  %8d  %8.2f  %8.2f  %8.2f  %8.2f  %8.2f\n",
+                   size, st.avg, st.min, st.p50, st.p99, st.max);
+            if (csv)
+                fprintf(csv, "%s,lat,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,\n",
+                        op, size, opts->iters,
+                        st.avg, st.min, st.p50, st.p99, st.max);
+            free(samples);
+        }
+    } else {
+        // write or read: one-sided, server just holds the barrier
+        bench_sync(syncfd);
+        if (!is_server) {
+            samples = malloc(opts->iters * sizeof(long));
+            int opcode = (strcmp(op, "write") == 0)
+                         ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
+
+            for (int i = 0; i < total; i++) {
+                long t0 = now_ns();
+                struct ibv_send_wr swr = {
+                    .wr_id               = 0,
+                    .sg_list             = &sge,
+                    .num_sge             = 1,
+                    .opcode              = opcode,
+                    .send_flags          = IBV_SEND_SIGNALED,
+                    .wr.rdma.remote_addr = remote->addr,
+                    .wr.rdma.rkey        = remote->rkey,
+                };
+                struct ibv_send_wr *bad;
+                ibv_post_send(conn->qp, &swr, &bad);
+                struct ibv_wc wc;
+                while (ibv_poll_cq(conn->cq, 1, &wc) == 0);
+                long t1 = now_ns();
+                if (i >= opts->warmup)
+                    samples[i - opts->warmup] = t1 - t0;
+            }
+
+            struct stats st = compute_stats(samples, opts->iters);
+            printf("  %8d  %8.2f  %8.2f  %8.2f  %8.2f  %8.2f\n",
+                   size, st.avg, st.min, st.p50, st.p99, st.max);
+            if (csv)
+                fprintf(csv, "%s,lat,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,\n",
+                        op, size, opts->iters,
+                        st.avg, st.min, st.p50, st.p99, st.max);
+            free(samples);
+        }
+        bench_sync(syncfd);
+    }
+
+    return 0;
+}
+
+static int bench_bw(struct connection *conn, struct qp_info *remote,
+                    int is_server, const char *op,
+                    struct bench_opts *opts, int size, int syncfd, FILE *csv)
+{
+    int depth = opts->depth;
+    int iters = opts->iters;
+    int initial = (depth < iters) ? depth : iters;
+
+    struct ibv_sge sge = {
+        .addr   = (uint64_t)conn->buf,
+        .length = (uint32_t)size,
+        .lkey   = conn->mr->lkey,
+    };
+
+    if (strcmp(op, "send-recv") == 0) {
+        if (is_server) {
+            for (int i = 0; i < initial; i++) {
+                struct ibv_recv_wr rwr = { .wr_id = 0, .sg_list = &sge, .num_sge = 1 };
+                struct ibv_recv_wr *bad;
+                ibv_post_recv(conn->qp, &rwr, &bad);
+            }
+            bench_sync(syncfd);
+
+            int completed = 0, posted = initial;
+            while (completed < iters) {
+                struct ibv_wc wc;
+                if (ibv_poll_cq(conn->cq, 1, &wc) > 0) {
+                    completed++;
+                    if (posted < iters) {
+                        struct ibv_recv_wr rwr = { .wr_id = 0, .sg_list = &sge, .num_sge = 1 };
+                        struct ibv_recv_wr *bad;
+                        ibv_post_recv(conn->qp, &rwr, &bad);
+                        posted++;
+                    }
+                }
+            }
+            bench_sync(syncfd);
+        } else {
+            bench_sync(syncfd);
+
+            long t0 = now_ns();
+            for (int i = 0; i < initial; i++) {
+                struct ibv_send_wr swr = {
+                    .wr_id = 0, .sg_list = &sge, .num_sge = 1,
+                    .opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED,
+                };
+                struct ibv_send_wr *bad;
+                ibv_post_send(conn->qp, &swr, &bad);
+            }
+
+            int completed = 0, posted = initial;
+            while (completed < iters) {
+                struct ibv_wc wc;
+                if (ibv_poll_cq(conn->cq, 1, &wc) > 0) {
+                    completed++;
+                    if (posted < iters) {
+                        struct ibv_send_wr swr = {
+                            .wr_id = 0, .sg_list = &sge, .num_sge = 1,
+                            .opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED,
+                        };
+                        struct ibv_send_wr *bad;
+                        ibv_post_send(conn->qp, &swr, &bad);
+                        posted++;
+                    }
+                }
+            }
+            long t1 = now_ns();
+            bench_sync(syncfd);
+
+            double gbps = (double)iters * size / (t1 - t0);
+            printf("  %8d  %10.2f  %10.1f\n", size, gbps, gbps * 8);
+            if (csv)
+                fprintf(csv, "%s,bw,%d,%d,,,,,,%.4f\n", op, size, iters, gbps);
+        }
+    } else {
+        // write or read: server idle
+        bench_sync(syncfd);
+        if (!is_server) {
+            int opcode = (strcmp(op, "write") == 0)
+                         ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
+
+            long t0 = now_ns();
+            for (int i = 0; i < initial; i++) {
+                struct ibv_send_wr swr = {
+                    .wr_id               = 0,
+                    .sg_list             = &sge,
+                    .num_sge             = 1,
+                    .opcode              = opcode,
+                    .send_flags          = IBV_SEND_SIGNALED,
+                    .wr.rdma.remote_addr = remote->addr,
+                    .wr.rdma.rkey        = remote->rkey,
+                };
+                struct ibv_send_wr *bad;
+                ibv_post_send(conn->qp, &swr, &bad);
+            }
+
+            int completed = 0, posted = initial;
+            while (completed < iters) {
+                struct ibv_wc wc;
+                if (ibv_poll_cq(conn->cq, 1, &wc) > 0) {
+                    completed++;
+                    if (posted < iters) {
+                        struct ibv_send_wr swr = {
+                            .wr_id               = 0,
+                            .sg_list             = &sge,
+                            .num_sge             = 1,
+                            .opcode              = opcode,
+                            .send_flags          = IBV_SEND_SIGNALED,
+                            .wr.rdma.remote_addr = remote->addr,
+                            .wr.rdma.rkey        = remote->rkey,
+                        };
+                        struct ibv_send_wr *bad;
+                        ibv_post_send(conn->qp, &swr, &bad);
+                        posted++;
+                    }
+                }
+            }
+            long t1 = now_ns();
+
+            double gbps = (double)iters * size / (t1 - t0);
+            printf("  %8d  %10.2f  %10.1f\n", size, gbps, gbps * 8);
+            if (csv)
+                fprintf(csv, "%s,bw,%d,%d,,,,,,%.4f\n", op, size, iters, gbps);
+        }
+        bench_sync(syncfd);
+    }
+
+    return 0;
+}
+
+static void parse_bench_opts(int argc, char *argv[], struct bench_opts *opts)
+{
+    opts->mode   = -1;
+    opts->iters  = 0;
+    opts->warmup = 100;
+    opts->size   = 64;
+    opts->sweep  = 0;
+    opts->depth  = 128;
+    opts->output = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--mode") == 0 && i+1 < argc) {
+            opts->mode = (strcmp(argv[++i], "lat") == 0) ? BENCH_LAT : BENCH_BW;
+        } else if (strcmp(argv[i], "--iters") == 0 && i+1 < argc) {
+            opts->iters = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--warmup") == 0 && i+1 < argc) {
+            opts->warmup = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--size") == 0 && i+1 < argc) {
+            opts->size = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--sweep") == 0) {
+            opts->sweep = 1;
+        } else if (strcmp(argv[i], "--depth") == 0 && i+1 < argc) {
+            opts->depth = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--output") == 0 && i+1 < argc) {
+            opts->output = argv[++i];
+        }
+    }
+
+    if (opts->iters == 0)
+        opts->iters = (opts->mode == BENCH_LAT) ? 10000 : 1000;
+}
+
+static int run_bench(struct connection *conn, struct qp_info *remote,
+                     int is_server, const char *op,
+                     struct bench_opts *opts, int syncfd)
+{
+    FILE *csv = NULL;
+    if (!is_server && opts->output) {
+        csv = fopen(opts->output, "w");
+        if (!csv) {
+            fprintf(stderr, "failed to open output file: %s\n", opts->output);
+            return -1;
+        }
+        fprintf(csv, "op,mode,size,iters,avg_us,min_us,p50_us,p99_us,max_us,gbps\n");
+    }
+
+    const int *sizes;
+    int n_sizes;
+    int single_size = opts->size;
+
+    if (opts->sweep) {
+        sizes   = SWEEP_SIZES;
+        n_sizes = N_SWEEP_SIZES;
+    } else {
+        sizes   = &single_size;
+        n_sizes = 1;
+    }
+
+    if (!is_server) {
+        if (opts->mode == BENCH_LAT) {
+            printf("op=%-10s  mode=lat  iters=%d  warmup=%d\n",
+                   op, opts->iters, opts->warmup);
+            printf("  %8s  %8s  %8s  %8s  %8s  %8s\n",
+                   "size(B)", "avg(us)", "min(us)", "p50(us)", "p99(us)", "max(us)");
+        } else {
+            printf("op=%-10s  mode=bw  iters=%d  depth=%d\n",
+                   op, opts->iters, opts->depth);
+            printf("  %8s  %10s  %10s\n", "size(B)", "GB/s", "Gb/s");
+        }
+    }
+
+    for (int i = 0; i < n_sizes; i++) {
+        if (opts->mode == BENCH_LAT)
+            bench_lat(conn, remote, is_server, op, opts, sizes[i], syncfd, csv);
+        else
+            bench_bw(conn, remote, is_server, op, opts, sizes[i], syncfd, csv);
+    }
+
+    if (csv) fclose(csv);
+    return 0;
+}
+
+// ── main ──────────────────────────────────────────────────────────────────────
+
 int main(int argc, char *argv[])
 {
-    const char *op, *role;
-    int is_server;
+    const char *op, *role, *server_ip = NULL;
+    int is_server, is_bench;
     struct connection *conn;
     struct qp_info local_info, remote_info;
     union ibv_gid gid;
+    int syncfd;
 
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <send-recv|write|read> <server|client> [server_ip]\n",
-                argv[0]);
+        fprintf(stderr,
+            "usage:\n"
+            "  %s <send-recv|write|read> <server|client> [ip]\n"
+            "  %s bench <send-recv|write|read> <server|client> [ip] [options]\n"
+            "options:\n"
+            "  --mode lat|bw   --iters N  --warmup N\n"
+            "  --size N        --sweep    --depth N\n"
+            "  --output file.csv\n",
+            argv[0], argv[0]);
         return 1;
     }
 
-    op   = argv[1];
-    role = argv[2];
+    is_bench = (strcmp(argv[1], "bench") == 0);
+
+    if (is_bench) {
+        if (argc < 5) {
+            fprintf(stderr, "bench requires op and role\n");
+            return 1;
+        }
+        op   = argv[2];
+        role = argv[3];
+    } else {
+        op   = argv[1];
+        role = argv[2];
+    }
 
     if (strcmp(op, "send-recv") != 0 &&
         strcmp(op, "write")     != 0 &&
@@ -415,17 +829,19 @@ int main(int argc, char *argv[])
     if (strcmp(role, "server") == 0) {
         is_server = 1;
     } else if (strcmp(role, "client") == 0) {
-        if (argc < 4) {
+        int ip_idx = is_bench ? 4 : 3;
+        if (argc <= ip_idx) {
             fprintf(stderr, "client requires server_ip\n");
             return 1;
         }
+        server_ip = argv[ip_idx];
         is_server = 0;
     } else {
         fprintf(stderr, "unknown role: %s\n", role);
         return 1;
     }
 
-    conn = init_connection();
+    conn = init_connection(is_bench ? BENCH_MAX_SIZE : MSG_SIZE);
     if (!conn) return 1;
 
     if (ibv_query_gid(conn->ctx, IB_PORT, GID_INDEX, &gid)) {
@@ -439,18 +855,31 @@ int main(int argc, char *argv[])
     local_info.addr = (uint64_t)conn->buf;
 
     if (is_server)
-        exchange_info_server(&local_info, &remote_info);
+        syncfd = exchange_info_server(&local_info, &remote_info);
     else
-        exchange_info_client(&local_info, &remote_info, argv[3]);
+        syncfd = exchange_info_client(&local_info, &remote_info, server_ip);
 
     if (modify_qp_to_rts(conn->qp, remote_info.qpn, remote_info.gid)) {
         fprintf(stderr, "failed to bring QP to RTS\n");
         return 1;
     }
 
-    if (strcmp(op, "send-recv") == 0) return op_send_recv(conn, &remote_info, is_server);
-    if (strcmp(op, "write")     == 0) return op_write    (conn, &remote_info, is_server);
-    if (strcmp(op, "read")      == 0) return op_read     (conn, &remote_info, is_server);
+    int ret = 0;
+    if (is_bench) {
+        struct bench_opts opts;
+        parse_bench_opts(argc, argv, &opts);
+        if (opts.mode < 0) {
+            fprintf(stderr, "bench requires --mode lat|bw\n");
+            return 1;
+        }
+        ret = run_bench(conn, &remote_info, is_server, op, &opts, syncfd);
+    } else {
+        close(syncfd);
+        if      (strcmp(op, "send-recv") == 0) ret = op_send_recv(conn, &remote_info, is_server);
+        else if (strcmp(op, "write")     == 0) ret = op_write    (conn, &remote_info, is_server);
+        else if (strcmp(op, "read")      == 0) ret = op_read     (conn, &remote_info, is_server);
+    }
 
-    return 0;
+    if (is_bench) close(syncfd);
+    return ret;
 }
