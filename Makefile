@@ -1,13 +1,9 @@
-CC = gcc
+CC     = gcc
 CFLAGS = -Wall -O2
-LIBS = -libverbs
+LIBS   = -libverbs
 
-rdma_hello: rdma_hello.c
-	$(CC) $(CFLAGS) -o rdma_hello rdma_hello.c $(LIBS)
-
-rdma_write: rdma_write.c
-	$(CC) $(CFLAGS) -o rdma_write rdma_write.c $(LIBS)
+rdma_demo: rdma_demo.c
+	$(CC) $(CFLAGS) -o rdma_demo rdma_demo.c $(LIBS)
 
 clean:
-	rm -f rdma_hello
-	rm -f rdma_hello rdma_write
+	rm -f rdma_demo
