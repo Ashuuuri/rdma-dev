@@ -111,7 +111,7 @@ struct connection *init_connection(void)
 }
 
 int modify_qp_to_rts(struct ibv_qp *qp, uint32_t remote_qpn,
-                     uint16_t remote_lid, union ibv_gid remote_gid)
+                     union ibv_gid remote_gid)
 {
     struct ibv_qp_attr attr;
     int flags;
@@ -181,6 +181,28 @@ struct qp_info {
     uint64_t addr;
 };
 
+static int send_all(int fd, const void *buf, size_t len)
+{
+    while (len > 0) {
+        ssize_t n = send(fd, buf, len, 0);
+        if (n <= 0) return -1;
+        buf = (const char *)buf + n;
+        len -= n;
+    }
+    return 0;
+}
+
+static int recv_all(int fd, void *buf, size_t len)
+{
+    while (len > 0) {
+        ssize_t n = recv(fd, buf, len, 0);
+        if (n <= 0) return -1;
+        buf = (char *)buf + n;
+        len -= n;
+    }
+    return 0;
+}
+
 void exchange_info_server(struct qp_info *local, struct qp_info *remote)
 {
     int sockfd, connfd;
@@ -202,10 +224,10 @@ void exchange_info_server(struct qp_info *local, struct qp_info *remote)
     connfd = accept(sockfd, NULL, NULL);
 
     // send local info to client
-    send(connfd, local, sizeof(*local), 0);
+    send_all(connfd, local, sizeof(*local));
 
     // receive remote info from client
-    recv(connfd, remote, sizeof(*remote), 0);
+    recv_all(connfd, remote, sizeof(*remote));
 
     close(connfd);
     close(sockfd);
@@ -227,10 +249,10 @@ void exchange_info_client(struct qp_info *local, struct qp_info *remote,
     connect(sockfd, (struct sockaddr *)&addr, sizeof(addr));
 
     // receive remote info from server
-    recv(sockfd, remote, sizeof(*remote), 0);
+    recv_all(sockfd, remote, sizeof(*remote));
 
     // send local info to server
-    send(sockfd, local, sizeof(*local), 0);
+    send_all(sockfd, local, sizeof(*local));
 
     close(sockfd);
 }
@@ -277,7 +299,10 @@ int main(int argc, char *argv[])
     }
 
     // bring QP to RTS
-    modify_qp_to_rts(conn->qp, remote_info.qpn, 0, remote_info.gid);
+    if (modify_qp_to_rts(conn->qp, remote_info.qpn, remote_info.gid)) {
+        fprintf(stderr, "failed to bring QP to RTS\n");
+        return 1;
+    }
 
     if (is_server) {
         // server just waits — client will WRITE directly into our buffer
