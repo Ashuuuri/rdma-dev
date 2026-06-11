@@ -13,6 +13,7 @@
 #define IB_PORT        1
 #define GID_INDEX      1
 #define MAX_WR         4096
+#define INLINE_HINT    256  // requested; actual granted stored in conn->max_inline
 
 #define BENCH_LAT 0
 #define BENCH_BW  1
@@ -30,10 +31,15 @@ struct connection {
     struct ibv_comp_channel *channel;
     struct ibv_qp           *qp;
     char                    *buf;
+    uint8_t                  link_layer;   // IBV_LINK_LAYER_INFINIBAND or _ETHERNET
+    uint16_t                 lid;
+    uint8_t                  active_mtu;   // IBV_MTU_* from port query
+    uint32_t                 max_inline;   // bytes the driver actually granted
 };
 
 struct qp_info {
     uint32_t      qpn;
+    uint16_t      lid;
     union ibv_gid gid;
     uint32_t      rkey;
     uint64_t      addr;
@@ -46,6 +52,7 @@ struct bench_opts {
     int   size;
     int   sweep;
     int   depth;
+    int   use_inline;
     char *output;
 };
 
@@ -108,9 +115,10 @@ static struct stats compute_stats(long *s, int n)
 
 static struct connection *init_connection(size_t buf_size)
 {
-    struct ibv_device **dev_list;
-    struct ibv_qp_init_attr qp_attr;
-    struct connection *conn;
+    struct ibv_device      **dev_list;
+    struct ibv_qp_init_attr  qp_attr;
+    struct ibv_port_attr     port_attr;
+    struct connection       *conn;
 
     conn = calloc(1, sizeof(*conn));
     if (!conn) {
@@ -149,9 +157,10 @@ static struct connection *init_connection(size_t buf_size)
     }
 
     conn->mr = ibv_reg_mr(conn->pd, conn->buf, buf_size,
-                          IBV_ACCESS_LOCAL_WRITE  |
-                          IBV_ACCESS_REMOTE_WRITE |
-                          IBV_ACCESS_REMOTE_READ);
+                          IBV_ACCESS_LOCAL_WRITE   |
+                          IBV_ACCESS_REMOTE_WRITE  |
+                          IBV_ACCESS_REMOTE_READ   |
+                          IBV_ACCESS_REMOTE_ATOMIC);
     if (!conn->mr) {
         fprintf(stderr, "failed to register mr\n");
         goto err_buf;
@@ -170,22 +179,34 @@ static struct connection *init_connection(size_t buf_size)
     }
 
     memset(&qp_attr, 0, sizeof(qp_attr));
-    qp_attr.send_cq          = conn->cq;
-    qp_attr.recv_cq          = conn->cq;
-    qp_attr.cap.max_send_wr  = MAX_WR;
-    qp_attr.cap.max_recv_wr  = MAX_WR;
-    qp_attr.cap.max_send_sge = 1;
-    qp_attr.cap.max_recv_sge = 1;
-    qp_attr.qp_type          = IBV_QPT_RC;
+    qp_attr.send_cq             = conn->cq;
+    qp_attr.recv_cq             = conn->cq;
+    qp_attr.cap.max_send_wr     = MAX_WR;
+    qp_attr.cap.max_recv_wr     = MAX_WR;
+    qp_attr.cap.max_send_sge    = 1;
+    qp_attr.cap.max_recv_sge    = 1;
+    qp_attr.cap.max_inline_data = INLINE_HINT;
+    qp_attr.qp_type             = IBV_QPT_RC;
 
     conn->qp = ibv_create_qp(conn->pd, &qp_attr);
     if (!conn->qp) {
         fprintf(stderr, "failed to create qp\n");
         goto err_cq;
     }
+    // ibv_create_qp updates cap fields to reflect what the driver actually granted
+    conn->max_inline = qp_attr.cap.max_inline_data;
+
+    if (ibv_query_port(conn->ctx, IB_PORT, &port_attr)) {
+        fprintf(stderr, "failed to query port\n");
+        goto err_qp;
+    }
+    conn->lid        = port_attr.lid;
+    conn->link_layer = port_attr.link_layer;
+    conn->active_mtu = port_attr.active_mtu;
 
     return conn;
 
+err_qp:      ibv_destroy_qp(conn->qp);
 err_cq:      ibv_destroy_cq(conn->cq);
 err_channel: ibv_destroy_comp_channel(conn->channel);
 err_mr:      ibv_dereg_mr(conn->mr);
@@ -196,8 +217,8 @@ err_conn:    free(conn);
     return NULL;
 }
 
-static int modify_qp_to_rts(struct ibv_qp *qp, uint32_t remote_qpn,
-                              union ibv_gid remote_gid)
+// IB mode: LID-based AH (no GRH).  RoCE/Ethernet: GID-based GRH.
+static int modify_qp_to_rts(struct connection *conn, struct qp_info *remote)
 {
     struct ibv_qp_attr attr;
     int flags;
@@ -206,32 +227,40 @@ static int modify_qp_to_rts(struct ibv_qp *qp, uint32_t remote_qpn,
     attr.qp_state        = IBV_QPS_INIT;
     attr.pkey_index      = 0;
     attr.port_num        = IB_PORT;
-    attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE  |
-                           IBV_ACCESS_REMOTE_WRITE |
-                           IBV_ACCESS_REMOTE_READ;
+    attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE   |
+                           IBV_ACCESS_REMOTE_WRITE  |
+                           IBV_ACCESS_REMOTE_READ   |
+                           IBV_ACCESS_REMOTE_ATOMIC;
     flags = IBV_QP_STATE | IBV_QP_PKEY_INDEX |
             IBV_QP_PORT  | IBV_QP_ACCESS_FLAGS;
-    if (ibv_modify_qp(qp, &attr, flags)) {
+    if (ibv_modify_qp(conn->qp, &attr, flags)) {
         fprintf(stderr, "failed to modify QP to INIT\n");
         return -1;
     }
 
     memset(&attr, 0, sizeof(attr));
-    attr.qp_state               = IBV_QPS_RTR;
-    attr.path_mtu               = IBV_MTU_1024;
-    attr.dest_qp_num            = remote_qpn;
-    attr.rq_psn                 = 0;
-    attr.max_dest_rd_atomic     = 1;
-    attr.min_rnr_timer          = 12;
-    attr.ah_attr.is_global      = 1;
-    attr.ah_attr.grh.dgid       = remote_gid;
-    attr.ah_attr.grh.hop_limit  = 1;
-    attr.ah_attr.grh.sgid_index = GID_INDEX;
-    attr.ah_attr.port_num       = IB_PORT;
+    attr.qp_state           = IBV_QPS_RTR;
+    attr.path_mtu           = conn->active_mtu;
+    attr.dest_qp_num        = remote->qpn;
+    attr.rq_psn             = 0;
+    attr.max_dest_rd_atomic = 16;
+    attr.min_rnr_timer      = 12;
+    attr.ah_attr.port_num   = IB_PORT;
+
+    if (conn->link_layer == IBV_LINK_LAYER_INFINIBAND) {
+        attr.ah_attr.is_global = 0;
+        attr.ah_attr.dlid      = remote->lid;
+    } else {
+        attr.ah_attr.is_global      = 1;
+        attr.ah_attr.grh.dgid       = remote->gid;
+        attr.ah_attr.grh.sgid_index = GID_INDEX;
+        attr.ah_attr.grh.hop_limit  = 1;
+    }
+
     flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
             IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
             IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
-    if (ibv_modify_qp(qp, &attr, flags)) {
+    if (ibv_modify_qp(conn->qp, &attr, flags)) {
         fprintf(stderr, "failed to modify QP to RTR\n");
         return -1;
     }
@@ -242,10 +271,10 @@ static int modify_qp_to_rts(struct ibv_qp *qp, uint32_t remote_qpn,
     attr.retry_cnt     = 7;
     attr.rnr_retry     = 7;
     attr.sq_psn        = 0;
-    attr.max_rd_atomic = 1;
+    attr.max_rd_atomic = 16;
     flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
             IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
-    if (ibv_modify_qp(qp, &attr, flags)) {
+    if (ibv_modify_qp(conn->qp, &attr, flags)) {
         fprintf(stderr, "failed to modify QP to RTS\n");
         return -1;
     }
@@ -280,7 +309,7 @@ static int exchange_info_server(struct qp_info *local, struct qp_info *remote)
 }
 
 static int exchange_info_client(struct qp_info *local, struct qp_info *remote,
-                                  const char *server_ip)
+                                const char *server_ip)
 {
     int sockfd;
     struct sockaddr_in addr;
@@ -447,6 +476,88 @@ static int op_read(struct connection *conn, struct qp_info *remote, int is_serve
     return 0;
 }
 
+// Server places 42 in its buffer; client CAS 42→99 and prints original value.
+static int op_atomic_cas(struct connection *conn, struct qp_info *remote, int is_server)
+{
+    uint64_t *val = (uint64_t *)conn->buf;
+
+    if (is_server) {
+        *val = 42ULL;
+        printf("server: value=42, waiting for CAS...\n");
+        sleep(2);
+        printf("server: value after CAS = %lu (expected 99)\n", *val);
+    } else {
+        struct ibv_sge sge = {
+            .addr   = (uint64_t)conn->buf,
+            .length = 8,
+            .lkey   = conn->mr->lkey,
+        };
+        struct ibv_send_wr swr = {
+            .wr_id      = 0,
+            .sg_list    = &sge,
+            .num_sge    = 1,
+            .opcode     = IBV_WR_ATOMIC_CMP_AND_SWP,
+            .send_flags = IBV_SEND_SIGNALED,
+            .wr.atomic  = {
+                .remote_addr = remote->addr,
+                .rkey        = remote->rkey,
+                .compare_add = 42ULL,
+                .swap        = 99ULL,
+            },
+        };
+        struct ibv_send_wr *bad;
+        if (ibv_post_send(conn->qp, &swr, &bad)) {
+            fprintf(stderr, "post_send (CAS) failed\n");
+            return -1;
+        }
+        if (poll_cq(conn->cq)) return -1;
+        printf("[atomic-cas] original = %lu (expected 42), swapped to 99\n", *val);
+    }
+    return 0;
+}
+
+// Server zeroes its buffer; client FAA +1 ten times and prints each prev value.
+static int op_atomic_faa(struct connection *conn, struct qp_info *remote, int is_server)
+{
+    uint64_t *val = (uint64_t *)conn->buf;
+
+    if (is_server) {
+        *val = 0ULL;
+        printf("server: counter=0, waiting for FAA x10...\n");
+        sleep(3);
+        printf("server: counter after FAA = %lu (expected 10)\n", *val);
+    } else {
+        struct ibv_sge sge = {
+            .addr   = (uint64_t)conn->buf,
+            .length = 8,
+            .lkey   = conn->mr->lkey,
+        };
+        for (int i = 0; i < 10; i++) {
+            struct ibv_send_wr swr = {
+                .wr_id      = i,
+                .sg_list    = &sge,
+                .num_sge    = 1,
+                .opcode     = IBV_WR_ATOMIC_FETCH_AND_ADD,
+                .send_flags = IBV_SEND_SIGNALED,
+                .wr.atomic  = {
+                    .remote_addr = remote->addr,
+                    .rkey        = remote->rkey,
+                    .compare_add = 1ULL,
+                },
+            };
+            struct ibv_send_wr *bad;
+            if (ibv_post_send(conn->qp, &swr, &bad)) {
+                fprintf(stderr, "post_send (FAA) failed at iter %d\n", i);
+                return -1;
+            }
+            if (poll_cq(conn->cq)) return -1;
+            printf("[atomic-faa] iter %2d: prev_val = %lu\n", i + 1, *val);
+        }
+        printf("[atomic-faa] done; server counter should be 10\n");
+    }
+    return 0;
+}
+
 // ── bench ─────────────────────────────────────────────────────────────────────
 
 // two-way handshake: neither side proceeds until both have called bench_sync
@@ -461,8 +572,9 @@ static int bench_lat(struct connection *conn, struct qp_info *remote,
                      int is_server, const char *op,
                      struct bench_opts *opts, int size, int syncfd, FILE *csv)
 {
-    int total = opts->warmup + opts->iters;
+    int total     = opts->warmup + opts->iters;
     long *samples = NULL;
+    int do_inline = opts->use_inline && (uint32_t)size <= conn->max_inline;
 
     struct ibv_sge sge = {
         .addr   = (uint64_t)conn->buf,
@@ -485,8 +597,11 @@ static int bench_lat(struct connection *conn, struct qp_info *remote,
                 if (i < total - 1)
                     ibv_post_recv(conn->qp, &rwr, &bad_rwr);
                 struct ibv_send_wr swr = {
-                    .wr_id = 0, .sg_list = &sge, .num_sge = 1,
-                    .opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED,
+                    .wr_id      = 0,
+                    .sg_list    = &sge,
+                    .num_sge    = 1,
+                    .opcode     = IBV_WR_SEND,
+                    .send_flags = IBV_SEND_SIGNALED | (do_inline ? IBV_SEND_INLINE : 0),
                 };
                 struct ibv_send_wr *bad_swr;
                 ibv_post_send(conn->qp, &swr, &bad_swr);
@@ -500,8 +615,11 @@ static int bench_lat(struct connection *conn, struct qp_info *remote,
             for (int i = 0; i < total; i++) {
                 long t0 = now_ns();
                 struct ibv_send_wr swr = {
-                    .wr_id = 0, .sg_list = &sge, .num_sge = 1,
-                    .opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED,
+                    .wr_id      = 0,
+                    .sg_list    = &sge,
+                    .num_sge    = 1,
+                    .opcode     = IBV_WR_SEND,
+                    .send_flags = IBV_SEND_SIGNALED | (do_inline ? IBV_SEND_INLINE : 0),
                 };
                 struct ibv_send_wr *bad_swr;
                 ibv_post_send(conn->qp, &swr, &bad_swr);
@@ -533,6 +651,8 @@ static int bench_lat(struct connection *conn, struct qp_info *remote,
             samples = malloc(opts->iters * sizeof(long));
             int opcode = (strcmp(op, "write") == 0)
                          ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
+            int inline_flag = (opcode == IBV_WR_RDMA_WRITE && do_inline)
+                              ? IBV_SEND_INLINE : 0;
 
             for (int i = 0; i < total; i++) {
                 long t0 = now_ns();
@@ -541,7 +661,7 @@ static int bench_lat(struct connection *conn, struct qp_info *remote,
                     .sg_list             = &sge,
                     .num_sge             = 1,
                     .opcode              = opcode,
-                    .send_flags          = IBV_SEND_SIGNALED,
+                    .send_flags          = IBV_SEND_SIGNALED | inline_flag,
                     .wr.rdma.remote_addr = remote->addr,
                     .wr.rdma.rkey        = remote->rkey,
                 };
@@ -573,9 +693,10 @@ static int bench_bw(struct connection *conn, struct qp_info *remote,
                     int is_server, const char *op,
                     struct bench_opts *opts, int size, int syncfd, FILE *csv)
 {
-    int depth = opts->depth;
-    int iters = opts->iters;
-    int initial = (depth < iters) ? depth : iters;
+    int depth     = opts->depth;
+    int iters     = opts->iters;
+    int initial   = (depth < iters) ? depth : iters;
+    int do_inline = opts->use_inline && (uint32_t)size <= conn->max_inline;
 
     struct ibv_sge sge = {
         .addr   = (uint64_t)conn->buf,
@@ -612,8 +733,11 @@ static int bench_bw(struct connection *conn, struct qp_info *remote,
             long t0 = now_ns();
             for (int i = 0; i < initial; i++) {
                 struct ibv_send_wr swr = {
-                    .wr_id = 0, .sg_list = &sge, .num_sge = 1,
-                    .opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED,
+                    .wr_id      = 0,
+                    .sg_list    = &sge,
+                    .num_sge    = 1,
+                    .opcode     = IBV_WR_SEND,
+                    .send_flags = IBV_SEND_SIGNALED | (do_inline ? IBV_SEND_INLINE : 0),
                 };
                 struct ibv_send_wr *bad;
                 ibv_post_send(conn->qp, &swr, &bad);
@@ -626,8 +750,11 @@ static int bench_bw(struct connection *conn, struct qp_info *remote,
                     completed++;
                     if (posted < iters) {
                         struct ibv_send_wr swr = {
-                            .wr_id = 0, .sg_list = &sge, .num_sge = 1,
-                            .opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED,
+                            .wr_id      = 0,
+                            .sg_list    = &sge,
+                            .num_sge    = 1,
+                            .opcode     = IBV_WR_SEND,
+                            .send_flags = IBV_SEND_SIGNALED | (do_inline ? IBV_SEND_INLINE : 0),
                         };
                         struct ibv_send_wr *bad;
                         ibv_post_send(conn->qp, &swr, &bad);
@@ -649,6 +776,8 @@ static int bench_bw(struct connection *conn, struct qp_info *remote,
         if (!is_server) {
             int opcode = (strcmp(op, "write") == 0)
                          ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
+            int inline_flag = (opcode == IBV_WR_RDMA_WRITE && do_inline)
+                              ? IBV_SEND_INLINE : 0;
 
             long t0 = now_ns();
             for (int i = 0; i < initial; i++) {
@@ -657,7 +786,7 @@ static int bench_bw(struct connection *conn, struct qp_info *remote,
                     .sg_list             = &sge,
                     .num_sge             = 1,
                     .opcode              = opcode,
-                    .send_flags          = IBV_SEND_SIGNALED,
+                    .send_flags          = IBV_SEND_SIGNALED | inline_flag,
                     .wr.rdma.remote_addr = remote->addr,
                     .wr.rdma.rkey        = remote->rkey,
                 };
@@ -676,7 +805,7 @@ static int bench_bw(struct connection *conn, struct qp_info *remote,
                             .sg_list             = &sge,
                             .num_sge             = 1,
                             .opcode              = opcode,
-                            .send_flags          = IBV_SEND_SIGNALED,
+                            .send_flags          = IBV_SEND_SIGNALED | inline_flag,
                             .wr.rdma.remote_addr = remote->addr,
                             .wr.rdma.rkey        = remote->rkey,
                         };
@@ -701,13 +830,14 @@ static int bench_bw(struct connection *conn, struct qp_info *remote,
 
 static void parse_bench_opts(int argc, char *argv[], struct bench_opts *opts)
 {
-    opts->mode   = -1;
-    opts->iters  = 0;
-    opts->warmup = 100;
-    opts->size   = 64;
-    opts->sweep  = 0;
-    opts->depth  = 128;
-    opts->output = NULL;
+    opts->mode       = -1;
+    opts->iters      = 0;
+    opts->warmup     = 100;
+    opts->size       = 64;
+    opts->sweep      = 0;
+    opts->depth      = 128;
+    opts->use_inline = 0;
+    opts->output     = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mode") == 0 && i+1 < argc) {
@@ -722,6 +852,8 @@ static void parse_bench_opts(int argc, char *argv[], struct bench_opts *opts)
             opts->sweep = 1;
         } else if (strcmp(argv[i], "--depth") == 0 && i+1 < argc) {
             opts->depth = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--inline") == 0) {
+            opts->use_inline = 1;
         } else if (strcmp(argv[i], "--output") == 0 && i+1 < argc) {
             opts->output = argv[++i];
         }
@@ -735,6 +867,11 @@ static int run_bench(struct connection *conn, struct qp_info *remote,
                      int is_server, const char *op,
                      struct bench_opts *opts, int syncfd)
 {
+    if (strcmp(op, "atomic-cas") == 0 || strcmp(op, "atomic-faa") == 0) {
+        fprintf(stderr, "atomic ops are not supported in bench mode\n");
+        return -1;
+    }
+
     FILE *csv = NULL;
     if (!is_server && opts->output) {
         csv = fopen(opts->output, "w");
@@ -759,13 +896,15 @@ static int run_bench(struct connection *conn, struct qp_info *remote,
 
     if (!is_server) {
         if (opts->mode == BENCH_LAT) {
-            printf("op=%-10s  mode=lat  iters=%d  warmup=%d\n",
-                   op, opts->iters, opts->warmup);
+            printf("op=%-10s  mode=lat  iters=%d  warmup=%d  inline=%s\n",
+                   op, opts->iters, opts->warmup,
+                   opts->use_inline ? "yes" : "no");
             printf("  %8s  %8s  %8s  %8s  %8s  %8s\n",
                    "size(B)", "avg(us)", "min(us)", "p50(us)", "p99(us)", "max(us)");
         } else {
-            printf("op=%-10s  mode=bw  iters=%d  depth=%d\n",
-                   op, opts->iters, opts->depth);
+            printf("op=%-10s  mode=bw  iters=%d  depth=%d  inline=%s\n",
+                   op, opts->iters, opts->depth,
+                   opts->use_inline ? "yes" : "no");
             printf("  %8s  %10s  %10s\n", "size(B)", "GB/s", "Gb/s");
         }
     }
@@ -795,12 +934,12 @@ int main(int argc, char *argv[])
     if (argc < 3) {
         fprintf(stderr,
             "usage:\n"
-            "  %s <send-recv|write|read> <server|client> [ip]\n"
+            "  %s <send-recv|write|read|atomic-cas|atomic-faa> <server|client> [ip]\n"
             "  %s bench <send-recv|write|read> <server|client> [ip] [options]\n"
             "options:\n"
             "  --mode lat|bw   --iters N  --warmup N\n"
             "  --size N        --sweep    --depth N\n"
-            "  --output file.csv\n",
+            "  --inline        --output file.csv\n",
             argv[0], argv[0]);
         return 1;
     }
@@ -819,9 +958,11 @@ int main(int argc, char *argv[])
         role = argv[2];
     }
 
-    if (strcmp(op, "send-recv") != 0 &&
-        strcmp(op, "write")     != 0 &&
-        strcmp(op, "read")      != 0) {
+    if (strcmp(op, "send-recv")  != 0 &&
+        strcmp(op, "write")      != 0 &&
+        strcmp(op, "read")       != 0 &&
+        strcmp(op, "atomic-cas") != 0 &&
+        strcmp(op, "atomic-faa") != 0) {
         fprintf(stderr, "unknown op: %s\n", op);
         return 1;
     }
@@ -844,12 +985,22 @@ int main(int argc, char *argv[])
     conn = init_connection(is_bench ? BENCH_MAX_SIZE : MSG_SIZE);
     if (!conn) return 1;
 
-    if (ibv_query_gid(conn->ctx, IB_PORT, GID_INDEX, &gid)) {
-        fprintf(stderr, "failed to query gid\n");
-        return 1;
+    printf("transport: %s",
+           conn->link_layer == IBV_LINK_LAYER_INFINIBAND ? "InfiniBand" : "RoCE");
+    if (conn->link_layer == IBV_LINK_LAYER_INFINIBAND)
+        printf(" (LID %u)", conn->lid);
+    printf(", max_inline=%u\n", conn->max_inline);
+
+    memset(&gid, 0, sizeof(gid));
+    if (conn->link_layer != IBV_LINK_LAYER_INFINIBAND) {
+        if (ibv_query_gid(conn->ctx, IB_PORT, GID_INDEX, &gid)) {
+            fprintf(stderr, "failed to query gid\n");
+            return 1;
+        }
     }
 
     local_info.qpn  = conn->qp->qp_num;
+    local_info.lid  = conn->lid;
     local_info.gid  = gid;
     local_info.rkey = conn->mr->rkey;
     local_info.addr = (uint64_t)conn->buf;
@@ -859,7 +1010,7 @@ int main(int argc, char *argv[])
     else
         syncfd = exchange_info_client(&local_info, &remote_info, server_ip);
 
-    if (modify_qp_to_rts(conn->qp, remote_info.qpn, remote_info.gid)) {
+    if (modify_qp_to_rts(conn, &remote_info)) {
         fprintf(stderr, "failed to bring QP to RTS\n");
         return 1;
     }
@@ -875,9 +1026,11 @@ int main(int argc, char *argv[])
         ret = run_bench(conn, &remote_info, is_server, op, &opts, syncfd);
     } else {
         close(syncfd);
-        if      (strcmp(op, "send-recv") == 0) ret = op_send_recv(conn, &remote_info, is_server);
-        else if (strcmp(op, "write")     == 0) ret = op_write    (conn, &remote_info, is_server);
-        else if (strcmp(op, "read")      == 0) ret = op_read     (conn, &remote_info, is_server);
+        if      (strcmp(op, "send-recv")  == 0) ret = op_send_recv (conn, &remote_info, is_server);
+        else if (strcmp(op, "write")      == 0) ret = op_write     (conn, &remote_info, is_server);
+        else if (strcmp(op, "read")       == 0) ret = op_read      (conn, &remote_info, is_server);
+        else if (strcmp(op, "atomic-cas") == 0) ret = op_atomic_cas(conn, &remote_info, is_server);
+        else if (strcmp(op, "atomic-faa") == 0) ret = op_atomic_faa(conn, &remote_info, is_server);
     }
 
     if (is_bench) close(syncfd);
