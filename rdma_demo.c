@@ -2,18 +2,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <time.h>
 #include <arpa/inet.h>
 #include <infiniband/verbs.h>
+#include "rdma.h"
 
 #define MSG            "Hello RDMA!"
 #define MSG_SIZE       64
 #define BENCH_MAX_SIZE (1 << 20)
-#define PORT           12345
-#define IB_PORT        1
-#define GID_INDEX      1
-#define MAX_WR         4096
-#define INLINE_HINT    256  // requested; actual granted stored in conn->max_inline
+#define DEMO_PORT      12345
 
 #define BENCH_LAT 0
 #define BENCH_BW  1
@@ -22,28 +18,6 @@ static const int SWEEP_SIZES[] = {
     64, 256, 1024, 4096, 16384, 65536, 262144, 1048576
 };
 #define N_SWEEP_SIZES ((int)(sizeof(SWEEP_SIZES) / sizeof(SWEEP_SIZES[0])))
-
-struct connection {
-    struct ibv_context      *ctx;
-    struct ibv_pd           *pd;
-    struct ibv_mr           *mr;
-    struct ibv_cq           *cq;
-    struct ibv_comp_channel *channel;
-    struct ibv_qp           *qp;
-    char                    *buf;
-    uint8_t                  link_layer;   // IBV_LINK_LAYER_INFINIBAND or _ETHERNET
-    uint16_t                 lid;
-    uint8_t                  active_mtu;   // IBV_MTU_* from port query
-    uint32_t                 max_inline;   // bytes the driver actually granted
-};
-
-struct qp_info {
-    uint32_t      qpn;
-    uint16_t      lid;
-    union ibv_gid gid;
-    uint32_t      rkey;
-    uint64_t      addr;
-};
 
 struct bench_opts {
     int   mode;
@@ -59,37 +33,6 @@ struct bench_opts {
 struct stats {
     double avg, min, p50, p99, max;
 };
-
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-static int send_all(int fd, const void *buf, size_t len)
-{
-    while (len > 0) {
-        ssize_t n = send(fd, buf, len, 0);
-        if (n <= 0) return -1;
-        buf = (const char *)buf + n;
-        len -= n;
-    }
-    return 0;
-}
-
-static int recv_all(int fd, void *buf, size_t len)
-{
-    while (len > 0) {
-        ssize_t n = recv(fd, buf, len, 0);
-        if (n <= 0) return -1;
-        buf = (char *)buf + n;
-        len -= n;
-    }
-    return 0;
-}
-
-static long now_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000000000L + ts.tv_nsec;
-}
 
 static int cmp_long(const void *a, const void *b)
 {
@@ -111,252 +54,6 @@ static struct stats compute_stats(long *s, int n)
     };
 }
 
-// ── RDMA setup ───────────────────────────────────────────────────────────────
-
-static struct connection *init_connection(size_t buf_size)
-{
-    struct ibv_device      **dev_list;
-    struct ibv_qp_init_attr  qp_attr;
-    struct ibv_port_attr     port_attr;
-    struct connection       *conn;
-
-    conn = calloc(1, sizeof(*conn));
-    if (!conn) {
-        fprintf(stderr, "failed to allocate connection\n");
-        return NULL;
-    }
-
-    dev_list = ibv_get_device_list(NULL);
-    if (!dev_list) {
-        fprintf(stderr, "failed to get device list\n");
-        goto err_conn;
-    }
-    if (!dev_list[0]) {
-        fprintf(stderr, "no RDMA device found\n");
-        ibv_free_device_list(dev_list);
-        goto err_conn;
-    }
-
-    conn->ctx = ibv_open_device(dev_list[0]);
-    ibv_free_device_list(dev_list);
-    if (!conn->ctx) {
-        fprintf(stderr, "failed to open device\n");
-        goto err_conn;
-    }
-
-    conn->pd = ibv_alloc_pd(conn->ctx);
-    if (!conn->pd) {
-        fprintf(stderr, "failed to allocate pd\n");
-        goto err_ctx;
-    }
-
-    conn->buf = calloc(1, buf_size);
-    if (!conn->buf) {
-        fprintf(stderr, "failed to allocate buffer\n");
-        goto err_pd;
-    }
-
-    conn->mr = ibv_reg_mr(conn->pd, conn->buf, buf_size,
-                          IBV_ACCESS_LOCAL_WRITE   |
-                          IBV_ACCESS_REMOTE_WRITE  |
-                          IBV_ACCESS_REMOTE_READ   |
-                          IBV_ACCESS_REMOTE_ATOMIC);
-    if (!conn->mr) {
-        fprintf(stderr, "failed to register mr\n");
-        goto err_buf;
-    }
-
-    conn->channel = ibv_create_comp_channel(conn->ctx);
-    if (!conn->channel) {
-        fprintf(stderr, "failed to create comp channel\n");
-        goto err_mr;
-    }
-
-    conn->cq = ibv_create_cq(conn->ctx, MAX_WR, NULL, conn->channel, 0);
-    if (!conn->cq) {
-        fprintf(stderr, "failed to create cq\n");
-        goto err_channel;
-    }
-
-    memset(&qp_attr, 0, sizeof(qp_attr));
-    qp_attr.send_cq             = conn->cq;
-    qp_attr.recv_cq             = conn->cq;
-    qp_attr.cap.max_send_wr     = MAX_WR;
-    qp_attr.cap.max_recv_wr     = MAX_WR;
-    qp_attr.cap.max_send_sge    = 1;
-    qp_attr.cap.max_recv_sge    = 1;
-    qp_attr.cap.max_inline_data = INLINE_HINT;
-    qp_attr.qp_type             = IBV_QPT_RC;
-
-    conn->qp = ibv_create_qp(conn->pd, &qp_attr);
-    if (!conn->qp) {
-        fprintf(stderr, "failed to create qp\n");
-        goto err_cq;
-    }
-    // ibv_create_qp updates cap fields to reflect what the driver actually granted
-    conn->max_inline = qp_attr.cap.max_inline_data;
-
-    if (ibv_query_port(conn->ctx, IB_PORT, &port_attr)) {
-        fprintf(stderr, "failed to query port\n");
-        goto err_qp;
-    }
-    conn->lid        = port_attr.lid;
-    conn->link_layer = port_attr.link_layer;
-    conn->active_mtu = port_attr.active_mtu;
-
-    return conn;
-
-err_qp:      ibv_destroy_qp(conn->qp);
-err_cq:      ibv_destroy_cq(conn->cq);
-err_channel: ibv_destroy_comp_channel(conn->channel);
-err_mr:      ibv_dereg_mr(conn->mr);
-err_buf:     free(conn->buf);
-err_pd:      ibv_dealloc_pd(conn->pd);
-err_ctx:     ibv_close_device(conn->ctx);
-err_conn:    free(conn);
-    return NULL;
-}
-
-// IB mode: LID-based AH (no GRH).  RoCE/Ethernet: GID-based GRH.
-static int modify_qp_to_rts(struct connection *conn, struct qp_info *remote)
-{
-    struct ibv_qp_attr attr;
-    int flags;
-
-    memset(&attr, 0, sizeof(attr));
-    attr.qp_state        = IBV_QPS_INIT;
-    attr.pkey_index      = 0;
-    attr.port_num        = IB_PORT;
-    attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE   |
-                           IBV_ACCESS_REMOTE_WRITE  |
-                           IBV_ACCESS_REMOTE_READ   |
-                           IBV_ACCESS_REMOTE_ATOMIC;
-    flags = IBV_QP_STATE | IBV_QP_PKEY_INDEX |
-            IBV_QP_PORT  | IBV_QP_ACCESS_FLAGS;
-    if (ibv_modify_qp(conn->qp, &attr, flags)) {
-        fprintf(stderr, "failed to modify QP to INIT\n");
-        return -1;
-    }
-
-    memset(&attr, 0, sizeof(attr));
-    attr.qp_state           = IBV_QPS_RTR;
-    attr.path_mtu           = conn->active_mtu;
-    attr.dest_qp_num        = remote->qpn;
-    attr.rq_psn             = 0;
-    attr.max_dest_rd_atomic = 16;
-    attr.min_rnr_timer      = 12;
-    attr.ah_attr.port_num   = IB_PORT;
-
-    if (conn->link_layer == IBV_LINK_LAYER_INFINIBAND) {
-        attr.ah_attr.is_global = 0;
-        attr.ah_attr.dlid      = remote->lid;
-    } else {
-        attr.ah_attr.is_global      = 1;
-        attr.ah_attr.grh.dgid       = remote->gid;
-        attr.ah_attr.grh.sgid_index = GID_INDEX;
-        attr.ah_attr.grh.hop_limit  = 1;
-    }
-
-    flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
-            IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
-            IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
-    if (ibv_modify_qp(conn->qp, &attr, flags)) {
-        fprintf(stderr, "failed to modify QP to RTR\n");
-        return -1;
-    }
-
-    memset(&attr, 0, sizeof(attr));
-    attr.qp_state      = IBV_QPS_RTS;
-    attr.timeout       = 14;
-    attr.retry_cnt     = 7;
-    attr.rnr_retry     = 7;
-    attr.sq_psn        = 0;
-    attr.max_rd_atomic = 16;
-    flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
-            IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
-    if (ibv_modify_qp(conn->qp, &attr, flags)) {
-        fprintf(stderr, "failed to modify QP to RTS\n");
-        return -1;
-    }
-
-    return 0;
-}
-
-// returns socket fd (kept open for bench sync)
-static int exchange_info_server(struct qp_info *local, struct qp_info *remote)
-{
-    int sockfd, connfd;
-    struct sockaddr_in addr;
-    int opt = 1;
-
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(PORT);
-
-    bind(sockfd, (struct sockaddr *)&addr, sizeof(addr));
-    listen(sockfd, 1);
-    connfd = accept(sockfd, NULL, NULL);
-    close(sockfd);
-
-    send_all(connfd, local, sizeof(*local));
-    recv_all(connfd, remote, sizeof(*remote));
-
-    return connfd;
-}
-
-static int exchange_info_client(struct qp_info *local, struct qp_info *remote,
-                                const char *server_ip)
-{
-    int sockfd;
-    struct sockaddr_in addr;
-
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(PORT);
-    inet_pton(AF_INET, server_ip, &addr.sin_addr);
-
-    connect(sockfd, (struct sockaddr *)&addr, sizeof(addr));
-
-    recv_all(sockfd, remote, sizeof(*remote));
-    send_all(sockfd, local, sizeof(*local));
-
-    return sockfd;
-}
-
-static int poll_cq(struct ibv_cq *cq)
-{
-    struct ibv_wc wc;
-    int ret;
-    while ((ret = ibv_poll_cq(cq, 1, &wc)) == 0);
-    if (ret < 0) {
-        fprintf(stderr, "poll_cq error: %d\n", ret);
-        return -1;
-    }
-    if (wc.status != IBV_WC_SUCCESS) {
-        fprintf(stderr, "wc error: %s\n", ibv_wc_status_str(wc.status));
-        return -1;
-    }
-    return 0;
-}
-
-static int wait_cq_event(struct connection *conn)
-{
-    struct ibv_cq *ev_cq;
-    void *ev_ctx;
-    if (ibv_get_cq_event(conn->channel, &ev_cq, &ev_ctx)) {
-        fprintf(stderr, "get_cq_event failed\n");
-        return -1;
-    }
-    ibv_ack_cq_events(ev_cq, 1);
-    return poll_cq(conn->cq);
-}
-
 // ── functional ops ───────────────────────────────────────────────────────────
 
 static int op_send_recv(struct connection *conn, struct qp_info *remote, int is_server)
@@ -374,7 +71,7 @@ static int op_send_recv(struct connection *conn, struct qp_info *remote, int is_
             fprintf(stderr, "post_recv failed\n");
             return -1;
         }
-        if (poll_cq(conn->cq)) return -1;
+        if (rdma_poll_cq(conn->cq)) return -1;
         printf("[recv] %s\n", conn->buf);
     } else {
         strncpy(conn->buf, MSG, MSG_SIZE);
@@ -390,7 +87,7 @@ static int op_send_recv(struct connection *conn, struct qp_info *remote, int is_
             fprintf(stderr, "post_send failed\n");
             return -1;
         }
-        if (poll_cq(conn->cq)) return -1;
+        if (rdma_poll_cq(conn->cq)) return -1;
         printf("[send] %s\n", conn->buf);
     }
     return 0;
@@ -416,7 +113,7 @@ static int op_write(struct connection *conn, struct qp_info *remote, int is_serv
             return -1;
         }
         printf("server: waiting for RDMA WRITE...\n");
-        if (wait_cq_event(conn)) return -1;
+        if (rdma_wait_event(conn)) return -1;
         printf("[write target] received: %s\n", conn->buf);
     } else {
         strncpy(conn->buf, MSG, MSG_SIZE);
@@ -435,7 +132,7 @@ static int op_write(struct connection *conn, struct qp_info *remote, int is_serv
             fprintf(stderr, "post_send failed\n");
             return -1;
         }
-        if (poll_cq(conn->cq)) return -1;
+        if (rdma_poll_cq(conn->cq)) return -1;
         printf("[write initiator] wrote: %s\n", conn->buf);
     }
     return 0;
@@ -446,8 +143,6 @@ static int op_read(struct connection *conn, struct qp_info *remote, int is_serve
     if (is_server) {
         strncpy(conn->buf, MSG, MSG_SIZE);
         printf("server: data ready, waiting for remote read...\n");
-        // RDMA READ is one-sided — server CPU not involved in the transfer.
-        // sleep keeps the buffer valid until client finishes.
         sleep(2);
         printf("server: done\n");
     } else {
@@ -470,13 +165,12 @@ static int op_read(struct connection *conn, struct qp_info *remote, int is_serve
             fprintf(stderr, "post_send failed\n");
             return -1;
         }
-        if (poll_cq(conn->cq)) return -1;
+        if (rdma_poll_cq(conn->cq)) return -1;
         printf("[read] %s\n", conn->buf);
     }
     return 0;
 }
 
-// Server places 42 in its buffer; client CAS 42→99 and prints original value.
 static int op_atomic_cas(struct connection *conn, struct qp_info *remote, int is_server)
 {
     uint64_t *val = (uint64_t *)conn->buf;
@@ -510,13 +204,12 @@ static int op_atomic_cas(struct connection *conn, struct qp_info *remote, int is
             fprintf(stderr, "post_send (CAS) failed\n");
             return -1;
         }
-        if (poll_cq(conn->cq)) return -1;
+        if (rdma_poll_cq(conn->cq)) return -1;
         printf("[atomic-cas] original = %lu (expected 42), swapped to 99\n", *val);
     }
     return 0;
 }
 
-// Server zeroes its buffer; client FAA +1 ten times and prints each prev value.
 static int op_atomic_faa(struct connection *conn, struct qp_info *remote, int is_server)
 {
     uint64_t *val = (uint64_t *)conn->buf;
@@ -550,7 +243,7 @@ static int op_atomic_faa(struct connection *conn, struct qp_info *remote, int is
                 fprintf(stderr, "post_send (FAA) failed at iter %d\n", i);
                 return -1;
             }
-            if (poll_cq(conn->cq)) return -1;
+            if (rdma_poll_cq(conn->cq)) return -1;
             printf("[atomic-faa] iter %2d: prev_val = %lu\n", i + 1, *val);
         }
         printf("[atomic-faa] done; server counter should be 10\n");
@@ -560,7 +253,6 @@ static int op_atomic_faa(struct connection *conn, struct qp_info *remote, int is
 
 // ── bench ─────────────────────────────────────────────────────────────────────
 
-// two-way handshake: neither side proceeds until both have called bench_sync
 static void bench_sync(int fd)
 {
     char b = 0;
@@ -584,7 +276,6 @@ static int bench_lat(struct connection *conn, struct qp_info *remote,
 
     if (strcmp(op, "send-recv") == 0) {
         if (is_server) {
-            // post first recv WR, signal ready, then run echo loop
             struct ibv_recv_wr rwr = { .wr_id = 0, .sg_list = &sge, .num_sge = 1 };
             struct ibv_recv_wr *bad_rwr;
             ibv_post_recv(conn->qp, &rwr, &bad_rwr);
@@ -593,7 +284,6 @@ static int bench_lat(struct connection *conn, struct qp_info *remote,
             for (int i = 0; i < total; i++) {
                 struct ibv_wc wc;
                 while (ibv_poll_cq(conn->cq, 1, &wc) == 0);
-                // post next recv before echoing to prevent RNR on subsequent iteration
                 if (i < total - 1)
                     ibv_post_recv(conn->qp, &rwr, &bad_rwr);
                 struct ibv_send_wr swr = {
@@ -645,7 +335,6 @@ static int bench_lat(struct connection *conn, struct qp_info *remote,
             free(samples);
         }
     } else {
-        // write or read: one-sided, server just holds the barrier
         bench_sync(syncfd);
         if (!is_server) {
             samples = malloc(opts->iters * sizeof(long));
@@ -771,7 +460,6 @@ static int bench_bw(struct connection *conn, struct qp_info *remote,
                 fprintf(csv, "%s,bw,%d,%d,,,,,,%.4f\n", op, size, iters, gbps);
         }
     } else {
-        // write or read: server idle
         bench_sync(syncfd);
         if (!is_server) {
             int opcode = (strcmp(op, "write") == 0)
@@ -928,7 +616,6 @@ int main(int argc, char *argv[])
     int is_server, is_bench;
     struct connection *conn;
     struct qp_info local_info, remote_info;
-    union ibv_gid gid;
     int syncfd;
 
     if (argc < 3) {
@@ -982,7 +669,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    conn = init_connection(is_bench ? BENCH_MAX_SIZE : MSG_SIZE);
+    conn = rdma_init(is_bench ? BENCH_MAX_SIZE : MSG_SIZE);
     if (!conn) return 1;
 
     printf("transport: %s",
@@ -991,26 +678,14 @@ int main(int argc, char *argv[])
         printf(" (LID %u)", conn->lid);
     printf(", max_inline=%u\n", conn->max_inline);
 
-    memset(&gid, 0, sizeof(gid));
-    if (conn->link_layer != IBV_LINK_LAYER_INFINIBAND) {
-        if (ibv_query_gid(conn->ctx, IB_PORT, GID_INDEX, &gid)) {
-            fprintf(stderr, "failed to query gid\n");
-            return 1;
-        }
-    }
-
-    local_info.qpn  = conn->qp->qp_num;
-    local_info.lid  = conn->lid;
-    local_info.gid  = gid;
-    local_info.rkey = conn->mr->rkey;
-    local_info.addr = (uint64_t)conn->buf;
+    rdma_fill_local_info(conn, &local_info);
 
     if (is_server)
-        syncfd = exchange_info_server(&local_info, &remote_info);
+        syncfd = rdma_exchange_server(&local_info, &remote_info, DEMO_PORT);
     else
-        syncfd = exchange_info_client(&local_info, &remote_info, server_ip);
+        syncfd = rdma_exchange_client(&local_info, &remote_info, server_ip, DEMO_PORT);
 
-    if (modify_qp_to_rts(conn, &remote_info)) {
+    if (rdma_modify_qp(conn, &remote_info)) {
         fprintf(stderr, "failed to bring QP to RTS\n");
         return 1;
     }
