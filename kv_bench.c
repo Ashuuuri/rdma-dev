@@ -10,7 +10,8 @@
 static const struct kv_ops *select_impl(const char *name)
 {
     if (strcmp(name, "pilaf") == 0) return &kv_pilaf_ops;
-    fprintf(stderr, "unknown impl: %s (choices: pilaf)\n", name);
+    if (strcmp(name, "herd")  == 0) return &kv_herd_ops;
+    fprintf(stderr, "unknown impl: %s (choices: pilaf, herd)\n", name);
     return NULL;
 }
 
@@ -66,17 +67,23 @@ int main(int argc, char *argv[])
     const struct kv_ops *ops = select_impl(impl_name);
     if (!ops) return 1;
 
-    struct connection *conn = rdma_init(KV_CLIENT_BUF_SIZE);
+    size_t cli_buf = ops->client_buf_size ? ops->client_buf_size : KV_CLIENT_BUF_SIZE;
+    struct connection *conn = rdma_init(cli_buf);
     if (!conn) return 1;
 
     struct qp_info local, remote;
     rdma_fill_local_info(conn, &local);
 
+    if (ops->pre_exchange && ops->pre_exchange(conn, &local, 0, 0)) return 1;
+
     int syncfd = rdma_exchange_client(&local, &remote, server_ip, KV_PORT);
     if (syncfd < 0) { fprintf(stderr, "exchange failed\n"); return 1; }
 
-    if (rdma_modify_qp(conn, &remote)) return 1;
+    if (!ops->skip_rc_qp && rdma_modify_qp(conn, &remote)) return 1;
     if (rdma_barrier(syncfd)) return 1;
+
+    if (ops->post_exchange &&
+        ops->post_exchange(conn, &remote, syncfd, 0, 0)) return 1;
 
     printf("kv_bench: impl=%s  op=%s  iters=%d  key_range=%d\n",
            impl_name, op, iters, key_range);

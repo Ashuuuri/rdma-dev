@@ -3,7 +3,7 @@ CFLAGS = -Wall -O2
 LIBS   = -libverbs
 
 RDMA_OBJS = rdma.o
-IMPL_OBJS = impls/kv_pilaf.o
+IMPL_OBJS = impls/kv_pilaf.o impls/kv_herd.o
 
 all: rdma_demo kv_server kv_bench
 

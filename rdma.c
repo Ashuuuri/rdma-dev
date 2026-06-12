@@ -149,17 +149,18 @@ void rdma_fill_local_info(struct connection *conn, struct qp_info *info)
     if (conn->link_layer != IBV_LINK_LAYER_INFINIBAND)
         ibv_query_gid(conn->ctx, IB_PORT, GID_INDEX, &gid);
 
-    info->qpn  = conn->qp->qp_num;
-    info->lid  = conn->lid;
-    info->gid  = gid;
-    info->rkey = conn->mr->rkey;
-    info->addr = (uint64_t)conn->buf;
+    info->qpn    = conn->qp->qp_num;
+    info->lid    = conn->lid;
+    info->gid    = gid;
+    info->rkey   = conn->mr->rkey;
+    info->addr   = (uint64_t)conn->buf;
+    info->uc_qpn = 0;   // filled by pre_exchange if UC QP is used
+    info->ud_qpn = 0;
 }
 
-// returns connected TCP fd used for later synchronization
-int rdma_exchange_server(struct qp_info *local, struct qp_info *remote, int port)
+int rdma_listen(int port)
 {
-    int sockfd, connfd;
+    int sockfd;
     struct sockaddr_in addr;
     int opt = 1;
 
@@ -171,14 +172,29 @@ int rdma_exchange_server(struct qp_info *local, struct qp_info *remote, int port
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port        = htons((uint16_t)port);
 
-    bind(sockfd, (struct sockaddr *)&addr, sizeof(addr));
-    listen(sockfd, 1);
-    connfd = accept(sockfd, NULL, NULL);
-    close(sockfd);
+    if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) ||
+        listen(sockfd, SOMAXCONN)) {
+        close(sockfd);
+        return -1;
+    }
+    return sockfd;
+}
 
+int rdma_accept(int lsock, struct qp_info *local, struct qp_info *remote)
+{
+    int connfd = accept(lsock, NULL, NULL);
+    if (connfd < 0) return -1;
     send_all(connfd, local,  sizeof(*local));
     recv_all(connfd, remote, sizeof(*remote));
+    return connfd;
+}
 
+int rdma_exchange_server(struct qp_info *local, struct qp_info *remote, int port)
+{
+    int lsock = rdma_listen(port);
+    if (lsock < 0) return -1;
+    int connfd = rdma_accept(lsock, local, remote);
+    close(lsock);
     return connfd;
 }
 
@@ -381,6 +397,241 @@ int rdma_cas(struct connection *conn, uint32_t rkey, uint64_t raddr,
     struct ibv_send_wr *bad;
     if (ibv_post_send(conn->qp, &swr, &bad)) return -1;
     return rdma_poll_cq(conn->cq);
+}
+
+// ── UC QP (HERD request path) ────────────────────────────────────────────────
+
+struct ibv_qp *rdma_alloc_uc_qp(struct connection *conn)
+{
+    struct ibv_qp_init_attr attr = {
+        .send_cq = conn->cq,
+        .recv_cq = conn->cq,
+        .cap     = { .max_send_wr = MAX_WR, .max_recv_wr = 1,
+                     .max_send_sge = 1,     .max_recv_sge = 1 },
+        .qp_type = IBV_QPT_UC,
+    };
+    return ibv_create_qp(conn->pd, &attr);
+}
+
+int rdma_init_uc_qp(struct connection *conn)
+{
+    conn->uc_qp = rdma_alloc_uc_qp(conn);
+    return conn->uc_qp ? 0 : -1;
+}
+
+int rdma_connect_uc_qp_to(struct connection *conn, struct ibv_qp *uc_qp,
+                           struct qp_info *remote)
+{
+    struct ibv_qp_attr attr;
+    int flags;
+
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state        = IBV_QPS_INIT;
+    attr.pkey_index      = 0;
+    attr.port_num        = IB_PORT;
+    attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE;
+    flags = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
+    if (ibv_modify_qp(uc_qp, &attr, flags)) return -1;
+
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state         = IBV_QPS_RTR;
+    attr.path_mtu         = conn->active_mtu;
+    attr.dest_qp_num      = remote->uc_qpn;
+    attr.rq_psn           = 0;
+    attr.ah_attr.port_num = IB_PORT;
+    if (conn->link_layer == IBV_LINK_LAYER_INFINIBAND) {
+        attr.ah_attr.is_global = 0;
+        attr.ah_attr.dlid      = remote->lid;
+    } else {
+        attr.ah_attr.is_global      = 1;
+        attr.ah_attr.grh.dgid       = remote->gid;
+        attr.ah_attr.grh.sgid_index = GID_INDEX;
+        attr.ah_attr.grh.hop_limit  = 1;
+    }
+    flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+            IBV_QP_DEST_QPN | IBV_QP_RQ_PSN;
+    if (ibv_modify_qp(uc_qp, &attr, flags)) return -1;
+
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_RTS;
+    attr.sq_psn   = 0;
+    return ibv_modify_qp(uc_qp, &attr, IBV_QP_STATE | IBV_QP_SQ_PSN) ? -1 : 0;
+}
+
+int rdma_connect_uc_qp(struct connection *conn, struct qp_info *remote)
+{
+    return rdma_connect_uc_qp_to(conn, conn->uc_qp, remote);
+}
+
+int rdma_uc_write_via(struct connection *conn, struct ibv_qp *uc_qp,
+                      uint32_t rkey, uint64_t raddr, const void *local, size_t len)
+{
+    struct ibv_sge sge = {
+        .addr   = (uint64_t)local,
+        .length = (uint32_t)len,
+        .lkey   = conn->mr->lkey,
+    };
+    struct ibv_send_wr swr = {
+        .wr_id               = 0,
+        .sg_list             = &sge,
+        .num_sge             = 1,
+        .opcode              = IBV_WR_RDMA_WRITE,
+        .send_flags          = IBV_SEND_SIGNALED,
+        .wr.rdma.remote_addr = raddr,
+        .wr.rdma.rkey        = rkey,
+    };
+    struct ibv_send_wr *bad;
+    if (ibv_post_send(uc_qp, &swr, &bad)) return -1;
+    return rdma_poll_cq(conn->cq);
+}
+
+int rdma_uc_write(struct connection *conn, uint32_t rkey, uint64_t raddr,
+                  const void *local, size_t len)
+{
+    return rdma_uc_write_via(conn, conn->uc_qp, rkey, raddr, local, len);
+}
+
+// ── UD QP (HERD response path) ───────────────────────────────────────────────
+
+#define HERD_QKEY 0x11111111U
+
+int rdma_init_ud_qp(struct connection *conn, size_t payload_size, int nslots)
+{
+    conn->ud_slot_size = UD_GRH_SIZE + payload_size;
+
+    if (nslots > 0) {
+        conn->ud_buf = calloc(nslots, conn->ud_slot_size);
+        if (!conn->ud_buf) return -1;
+        conn->ud_mr = ibv_reg_mr(conn->pd, conn->ud_buf,
+                                  (size_t)nslots * conn->ud_slot_size,
+                                  IBV_ACCESS_LOCAL_WRITE);
+        if (!conn->ud_mr) { free(conn->ud_buf); return -1; }
+    }
+
+    conn->ud_cq = ibv_create_cq(conn->ctx, MAX_WR, NULL, NULL, 0);
+    if (!conn->ud_cq) return -1;
+
+    struct ibv_qp_init_attr qa = {
+        .send_cq = conn->ud_cq,
+        .recv_cq = conn->ud_cq,
+        .cap     = { .max_send_wr  = MAX_WR,
+                     .max_recv_wr  = nslots > 0 ? nslots : 1,
+                     .max_send_sge = 1, .max_recv_sge = 1 },
+        .qp_type = IBV_QPT_UD,
+    };
+    conn->ud_qp = ibv_create_qp(conn->pd, &qa);
+    if (!conn->ud_qp) return -1;
+
+    struct ibv_qp_attr attr = {
+        .qp_state   = IBV_QPS_INIT,
+        .pkey_index = 0,
+        .port_num   = IB_PORT,
+        .qkey       = HERD_QKEY,
+    };
+    if (ibv_modify_qp(conn->ud_qp, &attr,
+            IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_QKEY))
+        return -1;
+
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_RTR;
+    if (ibv_modify_qp(conn->ud_qp, &attr, IBV_QP_STATE)) return -1;
+
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_RTS;
+    attr.sq_psn   = 0;
+    if (ibv_modify_qp(conn->ud_qp, &attr, IBV_QP_STATE | IBV_QP_SQ_PSN)) return -1;
+
+    for (int i = 0; i < nslots; i++) {
+        struct ibv_sge sge = {
+            .addr   = (uint64_t)(conn->ud_buf + i * conn->ud_slot_size),
+            .length = (uint32_t)conn->ud_slot_size,
+            .lkey   = conn->ud_mr->lkey,
+        };
+        struct ibv_recv_wr rwr = { .wr_id = (uint64_t)i, .sg_list = &sge, .num_sge = 1 };
+        struct ibv_recv_wr *bad;
+        if (ibv_post_recv(conn->ud_qp, &rwr, &bad)) return -1;
+    }
+    return 0;
+}
+
+struct ibv_ah *rdma_alloc_ah(struct connection *conn, struct qp_info *remote)
+{
+    struct ibv_ah_attr attr = { .port_num = IB_PORT };
+    if (conn->link_layer == IBV_LINK_LAYER_INFINIBAND) {
+        attr.is_global = 0;
+        attr.dlid      = remote->lid;
+    } else {
+        attr.is_global           = 1;
+        attr.grh.dgid            = remote->gid;
+        attr.grh.sgid_index      = GID_INDEX;
+        attr.grh.hop_limit       = 1;
+    }
+    return ibv_create_ah(conn->pd, &attr);
+}
+
+int rdma_create_ah(struct connection *conn, struct qp_info *remote)
+{
+    conn->peer_ah = rdma_alloc_ah(conn, remote);
+    return conn->peer_ah ? 0 : -1;
+}
+
+int rdma_ud_post_send(struct connection *conn, struct ibv_ah *ah, uint32_t remote_qpn,
+                      const void *buf, size_t len, int signaled)
+{
+    struct ibv_sge sge = {
+        .addr   = (uint64_t)buf,
+        .length = (uint32_t)len,
+        .lkey   = conn->mr->lkey,
+    };
+    struct ibv_send_wr swr = {
+        .wr_id      = 0,
+        .sg_list    = &sge,
+        .num_sge    = 1,
+        .opcode     = IBV_WR_SEND,
+        .send_flags = signaled ? IBV_SEND_SIGNALED : 0,
+        .wr.ud      = { .ah = ah, .remote_qpn = remote_qpn,
+                        .remote_qkey = HERD_QKEY },
+    };
+    struct ibv_send_wr *bad;
+    return ibv_post_send(conn->ud_qp, &swr, &bad) ? -1 : 0;
+}
+
+int rdma_ud_send_via(struct connection *conn, struct ibv_ah *ah, uint32_t remote_qpn,
+                     const void *buf, size_t len)
+{
+    if (rdma_ud_post_send(conn, ah, remote_qpn, buf, len, 1)) return -1;
+    return rdma_poll_cq(conn->ud_cq);
+}
+
+int rdma_ud_send(struct connection *conn, uint32_t remote_qpn,
+                 const void *buf, size_t len)
+{
+    return rdma_ud_send_via(conn, conn->peer_ah, remote_qpn, buf, len);
+}
+
+int rdma_ud_recv(struct connection *conn, void *out)
+{
+    struct ibv_wc wc;
+    int ret;
+    while ((ret = ibv_poll_cq(conn->ud_cq, 1, &wc)) == 0);
+    if (ret < 0 || wc.status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "rdma_ud_recv: %s\n",
+                ret < 0 ? "poll error" : ibv_wc_status_str(wc.status));
+        return -1;
+    }
+    int slot = (int)wc.wr_id;
+    memcpy(out, conn->ud_buf + slot * conn->ud_slot_size + UD_GRH_SIZE,
+           conn->ud_slot_size - UD_GRH_SIZE);
+
+    struct ibv_sge sge = {
+        .addr   = (uint64_t)(conn->ud_buf + slot * conn->ud_slot_size),
+        .length = (uint32_t)conn->ud_slot_size,
+        .lkey   = conn->ud_mr->lkey,
+    };
+    struct ibv_recv_wr rwr = { .wr_id = (uint64_t)slot, .sg_list = &sge, .num_sge = 1 };
+    struct ibv_recv_wr *bad;
+    ibv_post_recv(conn->ud_qp, &rwr, &bad);
+    return 0;
 }
 
 // ── two-sided primitives ──────────────────────────────────────────────────────
